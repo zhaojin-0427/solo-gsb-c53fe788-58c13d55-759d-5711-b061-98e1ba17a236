@@ -1,4 +1,10 @@
-"""SQLite 持久化层：项目、字幕条目、镜头、采纳状态、镜头留白审阅结论。"""
+"""SQLite 持久化层：项目、字幕条目、镜头、采纳状态、镜头留白审阅结论、
+逐条文案修订。
+
+文案修订：cues.edited_text / edited_graphemes 为修订稿（归一化后的可见文本
+与其字素数），NULL 表示未修订——当前文案即 COALESCE(edited_text, text)。
+导入列（text / graphemes / raw_hash）自导入后永不改写，恢复导入原文 =
+把修订列置回 NULL。"""
 from __future__ import annotations
 
 import os
@@ -30,7 +36,9 @@ CREATE TABLE IF NOT EXISTS cues (
     text         TEXT NOT NULL,
     raw_text     TEXT NOT NULL,
     graphemes    INTEGER NOT NULL,
-    raw_hash     TEXT NOT NULL
+    raw_hash     TEXT NOT NULL,
+    edited_text  TEXT,
+    edited_graphemes INTEGER
 );
 CREATE TABLE IF NOT EXISTS shots (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,6 +117,12 @@ def init_db() -> None:
     conn = _connect()
     try:
         conn.executescript(_SCHEMA)
+        # 旧库迁移：逐条文案修订列（已存在的库按新 schema 不会重建表）
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(cues)")}
+        if "edited_text" not in cols:
+            conn.execute("ALTER TABLE cues ADD COLUMN edited_text TEXT")
+        if "edited_graphemes" not in cols:
+            conn.execute("ALTER TABLE cues ADD COLUMN edited_graphemes INTEGER")
     finally:
         conn.close()
 
@@ -194,6 +208,47 @@ def upsert_adoption(
 def delete_adoption(conn: sqlite3.Connection, pid: int, cue_uid: int) -> None:
     conn.execute(
         "DELETE FROM adoptions WHERE project_id=? AND cue_uid=?", (pid, cue_uid)
+    )
+
+
+# ---------- 逐条文案修订 ----------
+
+def get_cue(conn: sqlite3.Connection, pid: int,
+            cue_uid: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM cues WHERE project_id=? AND id=?", (pid, cue_uid)
+    ).fetchone()
+
+
+def current_text(row: sqlite3.Row) -> str:
+    """一条 cue 的当前文案：已修订取修订稿，否则取导入时的可见文本。"""
+    return row["edited_text"] if row["edited_text"] is not None else row["text"]
+
+
+def current_graphemes(row: sqlite3.Row) -> int:
+    """当前文案的字素数（CPS 与详情展示用）。"""
+    return (row["edited_graphemes"] if row["edited_graphemes"] is not None
+            else row["graphemes"])
+
+
+def update_cue_text(
+    conn: sqlite3.Connection, pid: int, cue_uid: int,
+    edited_text: str, edited_graphemes: int,
+) -> None:
+    """落一条修订稿（已按导入同一套规则归一化）。导入列不改写。"""
+    conn.execute(
+        "UPDATE cues SET edited_text=?, edited_graphemes=?"
+        " WHERE project_id=? AND id=?",
+        (edited_text, edited_graphemes, pid, cue_uid),
+    )
+
+
+def clear_cue_text_edit(conn: sqlite3.Connection, pid: int, cue_uid: int) -> None:
+    """恢复导入原文：清除修订稿，当前文案回落到导入列。"""
+    conn.execute(
+        "UPDATE cues SET edited_text=NULL, edited_graphemes=NULL"
+        " WHERE project_id=? AND id=?",
+        (pid, cue_uid),
     )
 
 

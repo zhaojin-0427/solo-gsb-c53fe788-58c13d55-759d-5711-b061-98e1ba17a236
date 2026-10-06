@@ -14,6 +14,9 @@ const state = {
   // 读取快照，绝不读取文件框当前值，避免把改选未提交稿的结论当成旧稿的。
   verifySnapshot: null,  // {file, name, projectId} 最近一次已提交的稿件
   verifyAutoInFlight: false,  // 同一生效轴上的自动重核是否在途（防重复触发）
+  // 文案修订：{uid, baseText}。baseText 是打开编辑时该条的当前文案，保存 /
+  // 恢复时随请求上送，服务端据此识别旧页面提交（另一标签页先改过则 409）。
+  textEditing: null,
 };
 
 const VERIFY_LABEL = {
@@ -56,9 +59,19 @@ async function api(path, opts = {}) {
     ...opts,
   });
   if (!res.ok) {
-    let msg = `HTTP ${res.status}`;
-    try { msg = (await res.json()).detail || msg; } catch (_) {}
-    throw new Error(msg);
+    let msg = `HTTP ${res.status}`, detail = null;
+    try {
+      const body = await res.json();
+      detail = body.detail ?? null;
+      // detail 可能是字符串，也可能是结构化对象（如文案修订 409 冲突
+      // 携带 {message, current_text, edited}，供页面展示最新文案）
+      if (typeof detail === "string") msg = detail;
+      else if (detail && detail.message) msg = detail.message;
+    } catch (_) {}
+    const err = new Error(msg);
+    err.status = res.status;
+    err.detail = detail;
+    throw err;
   }
   return res.json();
 }
@@ -375,10 +388,147 @@ function renderDeliveryVerify() {
   }
 }
 
+// ---------- 逐条文案修订 ----------
+// 每行「修订」打开表格外侧的独立编辑面板（render 全量重建表格时不受影响，
+// 草稿不丢）。保存 / 恢复都携带打开编辑时的当前文案作为 base_text：服务端
+// 在写锁内比对，若另一标签页已先改过则 409 拒绝覆盖并回传最新文案——页面
+// 把最新文案载入编辑框并提示，绝不静默覆盖。恢复导入原文即清除修订稿。
+const _graphemeSegmenter = (typeof Intl !== "undefined" && Intl.Segmenter)
+  ? new Intl.Segmenter(undefined, { granularity: "grapheme" }) : null;
+
+function normalizeDraftText(s) {   // 与服务端同一套归一化：去标签、折叠空白
+  return String(s).replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+}
+
+function countDraftGraphemes(s) {  // UAX #29 字素簇计数（预览，以服务端为准）
+  const t = normalizeDraftText(s);
+  if (!_graphemeSegmenter) return null;
+  return [..._graphemeSegmenter.segment(t)].length;
+}
+
+function editingCue() {
+  const ed = state.textEditing;
+  if (!ed || !state.project) return null;
+  return state.project.analysis.cues.find(c => c.uid === ed.uid) || null;
+}
+
+function closeTextEdit() {
+  state.textEditing = null;
+  $("#textEditPanel").classList.add("hidden");
+  $("#textEditHint").textContent = "";
+}
+
+function openTextEdit(uid) {
+  const c = state.project && state.project.analysis.cues.find(x => x.uid === uid);
+  if (!c) return;
+  state.textEditing = { uid, baseText: c.text };
+  $("#textEditInput").value = c.text;
+  $("#textEditHint").textContent = "";
+  $("#textEditPanel").classList.remove("hidden");
+  renderTextEditInfo();
+  updateTextEditPreview();
+  $("#textEditInput").focus();
+}
+
+// 面板静态信息（cue_id / 原时间 / 导入原文 / 库中当前文案 / 字素 / CPS）：
+// 打开时与每次 render 时按最新详情刷新；不触碰编辑框内容。
+function renderTextEditInfo() {
+  const c = editingCue();
+  if (!c) { closeTextEdit(); return; }
+  const editedNote = c.edited
+    ? `<span class="pill edited">已修订</span>`
+    : `<span class="pill proposed">未修订</span>`;
+  $("#textEditInfo").innerHTML = `
+    <div><b>cue ${esc(c.cue_id)}</b>（#${c.ord}，原时间 ${c.start_ms} → ${c.end_ms} ms，
+      时长 ${c.duration_ms} ms）${editedNote}</div>
+    <div class="hash">导入原文：${esc(c.imported_text)}
+      （sha256:${c.raw_hash.slice(0, 16)}…）</div>
+    <div class="hash">库中当前文案：${esc(c.text)}　字素 ${c.graphemes} ·
+      CPS ${c.cps === Infinity ? "∞" : c.cps}</div>`;
+  $("#textEditRestore").style.display = c.edited ? "" : "none";
+}
+
+function updateTextEditPreview() {
+  const c = editingCue();
+  const el = $("#textEditPreview");
+  if (!c) { el.textContent = ""; return; }
+  const draft = $("#textEditInput").value;
+  const norm = normalizeDraftText(draft);
+  if (!norm) {
+    el.textContent = "归一化后为空：去标签、折叠空白后需至少保留一个可见字符，否则无法保存。";
+    return;
+  }
+  const n = countDraftGraphemes(draft);
+  if (n == null) { el.textContent = `归一化预览：${norm}`; return; }
+  const cps = c.duration_ms > 0 ? (n * 1000 / c.duration_ms) : Infinity;
+  const cpsTxt = cps === Infinity ? "∞" : (Math.round(cps * 100) / 100).toString();
+  const over = state.project && cps > state.project.cps_limit ? "（超 CPS 上限）" : "";
+  el.textContent = `草稿字素 ${n} · 预计 CPS ${cpsTxt}${over}（以服务端保存结果为准）`;
+}
+
+// 409：另一标签页已先改过该条。拒绝覆盖——把服务端回传的最新文案载入
+// 编辑框、更新编辑基准，并刷新项目详情；用户基于最新文案重新编辑。
+function handleTextEditConflict(e) {
+  const d = e.detail;
+  if (e.status !== 409 || !d || typeof d !== "object") return false;
+  const ed = state.textEditing;
+  if (ed) {
+    ed.baseText = d.current_text;
+    $("#textEditInput").value = d.current_text;
+    $("#textEditHint").textContent =
+      "该条文案已在别处被修改，编辑框已载入最新文案，请在此基础上重新编辑后再保存。";
+    updateTextEditPreview();
+  }
+  toast("该条文案已在别处被修改，已载入最新文案", true);
+  if (state.project) refreshAfterConflict(state.project.id);
+  return true;
+}
+
+async function saveTextEdit() {
+  const ed = state.textEditing;
+  if (!ed || !state.project) return;
+  const pid = state.project.id;
+  try {
+    state.project = await api(`/api/projects/${pid}/cues/${ed.uid}/text`, {
+      method: "PUT",
+      body: JSON.stringify({ text: $("#textEditInput").value,
+                             base_text: ed.baseText }),
+    });
+    toast("文案修订已保存");
+    closeTextEdit();
+    render();
+    loadProjects();
+  } catch (e) {
+    if (handleTextEditConflict(e)) return;
+    toast(e.message, true);   // 空白稿 / cue 不存在等：不落库，仅提示
+  }
+}
+
+async function restoreTextEdit() {
+  const ed = state.textEditing;
+  if (!ed || !state.project) return;
+  const pid = state.project.id;
+  try {
+    state.project = await api(
+      `/api/projects/${pid}/cues/${ed.uid}/text/restore`, {
+        method: "POST",
+        body: JSON.stringify({ base_text: ed.baseText }),
+      });
+    toast("已恢复导入原文");
+    closeTextEdit();
+    render();
+    loadProjects();
+  } catch (e) {
+    if (handleTextEditConflict(e)) return;
+    toast(e.message, true);
+  }
+}
+
 function render() {
   syncDeliveryVerify();   // 先按最新生效轴同步核验状态（作废/自动重核）
   const p = state.project;
   if (!p) {
+    closeTextEdit();
     $("#workspace").classList.add("hidden");
     $("#importPanel").classList.remove("hidden");
     renderDeliveryVerify();
@@ -450,14 +600,22 @@ function render() {
       <div class="row-actions">
         ${canAdopt ? `<button class="mini primary" data-act="adopt" data-uid="${c.uid}">采纳</button>` : ""}
         ${c.adopted ? `<button class="mini" data-act="revert" data-uid="${c.uid}">撤销</button>` : ""}
+        <button class="mini" data-act="edit" data-uid="${c.uid}">修订</button>
       </div>`;
     const startShown = c.adopted_start_ms ?? c.start_ms;
     const endShown = c.adopted_end_ms ?? c.end_ms;
+    // 文案列：当前文案（已修订取修订稿）；已修订时附徽标与导入原文对照，
+    // 原文哈希始终指向导入内容。
+    const textCell = c.edited
+      ? `${esc(c.text)} <span class="pill edited">已修订</span>
+         <div class="hash">导入原文：${esc(c.imported_text)}</div>
+         <div class="hash">sha256:${c.raw_hash.slice(0, 16)}…（导入原文）</div>`
+      : `${esc(c.text)}<div class="hash">sha256:${c.raw_hash.slice(0, 16)}…</div>`;
     tr.className = c.proposal_start_ms == null ? "row-bad" : "";
     tr.innerHTML = `
       <td>${c.ord}</td>
       <td>${esc(c.cue_id)}</td>
-      <td class="text-cell">${esc(c.text)}<div class="hash">sha256:${c.raw_hash.slice(0, 16)}…</div></td>
+      <td class="text-cell">${textCell}</td>
       <td>${startShown} → ${endShown}</td>
       <td>${c.duration_ms}</td>
       <td>${c.graphemes}</td>
@@ -476,6 +634,9 @@ function render() {
   $("#projectSelect").value = String(p.id);
   renderGapReview(p);
   renderDeliveryVerify();
+  // 编辑面板打开期间，参数重算 / 采纳 / 别处修订等引起的刷新只更新面板
+  // 静态信息（库中当前文案、字素、CPS），不覆盖编辑框里的草稿。
+  if (state.textEditing) renderTextEditInfo();
 }
 
 // 采纳可能因另一标签页并发改参数而被拒（旧提案失效）：重新拉取详情，
@@ -502,6 +663,7 @@ $("#importForm").addEventListener("submit", async (ev) => {
   try {
     state.project = await api("/api/projects", { method: "POST", body: fd });
     resetDeliveryVerify();
+    closeTextEdit();
     toast("导入并分析完成");
     await loadProjects();
     render();
@@ -533,6 +695,10 @@ $("#cueTable").addEventListener("click", async (ev) => {
   const uid = parseInt(btn.dataset.uid, 10);
   const c = state.project.analysis.cues.find(x => x.uid === uid);
   const pid = state.project.id;
+  if (btn.dataset.act === "edit") {   // 打开文案修订面板（非请求，无需 try）
+    openTextEdit(uid);
+    return;
+  }
   try {
     if (btn.dataset.act === "adopt") {
       state.project = await api(`/api/projects/${pid}/adopt`, {
@@ -617,6 +783,13 @@ $("#gapList").addEventListener("click", async (ev) => {
   }
 });
 
+// 文案修订面板：保存 / 恢复导入原文 / 取消；输入时实时给出归一化后的
+// 字素数与预计 CPS（预览，最终以服务端保存结果为准）。
+$("#textEditSave").addEventListener("click", saveTextEdit);
+$("#textEditRestore").addEventListener("click", restoreTextEdit);
+$("#textEditCancel").addEventListener("click", closeTextEdit);
+$("#textEditInput").addEventListener("input", updateTextEditPreview);
+
 // 交付字幕核验：提交回传稿，服务端保序最优对应后返回逐行结论。
 // 提交动作是稿件切换的唯一边界：无论文件框之前改选过什么，只有点下
 // 「上传并核验」才把当前文件记为已提交稿件快照，此后自动重核 / 跨标签页
@@ -644,6 +817,7 @@ $("#deleteProjectBtn").addEventListener("click", async () => {  if (!state.proje
     await api(`/api/projects/${state.project.id}`, { method: "DELETE" });
     state.project = null;
     resetDeliveryVerify();
+    closeTextEdit();
     toast("项目已删除");
     await loadProjects();
     render();
@@ -654,6 +828,7 @@ $("#projectSelect").addEventListener("change", async (ev) => {
   const id = ev.target.value;
   if (!id) return;
   resetDeliveryVerify();   // 先作废旧项目核验并使在途响应失效，再切换
+  closeTextEdit();         // 编辑面板不跨项目保留
   try {
     state.project = await api(`/api/projects/${id}`);
     render();
@@ -663,6 +838,7 @@ $("#projectSelect").addEventListener("change", async (ev) => {
 $("#newProjectBtn").addEventListener("click", () => {
   state.project = null;
   resetDeliveryVerify();
+  closeTextEdit();
   $("#projectSelect").value = "";
   render();
 });

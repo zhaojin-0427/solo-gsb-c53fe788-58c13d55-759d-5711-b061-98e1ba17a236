@@ -16,9 +16,9 @@ class CueReport:
     start_ms: int
     end_ms: int
     duration_ms: int
-    text: str
-    graphemes: int
-    raw_hash: str
+    text: str                     # 当前文案（已修订取修订稿）
+    graphemes: int                # 当前文案字素数（CPS 依据）
+    raw_hash: str                 # 导入原文 SHA-256（不随修订改变）
     cps: float
     cps_ok: bool
     overlap_with: str | None = None      # 与前一条重叠/间隔不足
@@ -28,6 +28,8 @@ class CueReport:
     adopted: bool = False
     adopted_start_ms: int | None = None
     adopted_end_ms: int | None = None
+    edited: bool = False                 # 文案是否被修订过
+    imported_text: str = ""              # 导入原文（可见文本）
 
 
 @dataclass

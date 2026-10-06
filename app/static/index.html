@@ -91,6 +91,25 @@
       </table>
     </div>
 
+    <!-- 逐条文案修订 -->
+    <section id="textEditPanel" class="gap-review hidden">
+      <h3>文案修订</h3>
+      <p class="hint">保存时按导入同一套规则归一化：去除标签、折叠空白，
+        按 Unicode 扩展字素簇（UAX #29）重新计字素并更新 CPS；归一化后为空
+        不予保存。修订只改当前文案——cue_id、原时间、采纳与镜头留白结论不变，
+        导出 JSON 的原文哈希仍指向导入内容。可随时「恢复导入原文」。</p>
+      <div id="textEditInfo" class="text-edit-info"></div>
+      <textarea id="textEditInput" rows="3" spellcheck="false"
+                placeholder="输入修订后的文案"></textarea>
+      <div id="textEditPreview" class="hint"></div>
+      <div class="actions">
+        <button id="textEditSave" type="button" class="primary">保存修订</button>
+        <button id="textEditRestore" type="button">恢复导入原文</button>
+        <button id="textEditCancel" type="button">取消</button>
+      </div>
+      <p class="hint" id="textEditHint"></p>
+    </section>
+
     <!-- 镜头留白审阅 -->
     <section id="gapReviewPanel" class="gap-review hidden">
       <h3>镜头留白审阅</h3>

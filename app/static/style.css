@@ -140,6 +140,22 @@ tr.row-proposed td { }
 .pill.intentional { background: rgba(62,207,142,.15); color: var(--good); }
 .pill.needs-sub { background: rgba(242,180,65,.14); color: var(--warn); }
 
+/* 逐条文案修订 */
+.pill.edited { background: rgba(78,161,255,.14); color: var(--accent); }
+.text-edit-info {
+  background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 8px; padding: 10px 12px; margin: 8px 0;
+  display: flex; flex-direction: column; gap: 4px; font-size: 13px;
+}
+.text-edit-info .hash { word-break: break-all; white-space: normal; }
+#textEditPanel textarea {
+  width: 100%; min-height: 64px; resize: vertical;
+  font: inherit; color: var(--text);
+  background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 6px; padding: 8px 10px; margin-top: 8px;
+}
+#textEditPanel textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
 /* 交付字幕核验 */
 .delivery-form { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 10px 0; }
 .delivery-form .muted { font-size: 12px; }

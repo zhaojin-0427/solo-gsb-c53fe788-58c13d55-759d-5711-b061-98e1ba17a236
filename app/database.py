@@ -1,4 +1,5 @@
-"""SQLite 持久化层：项目、字幕条目、镜头、采纳状态、镜头留白审阅结论。"""
+"""SQLite 持久化层：项目、字幕条目、镜头、采纳状态、镜头留白审阅结论、
+逐条文案修订稿。"""
 from __future__ import annotations
 
 import os
@@ -27,10 +28,18 @@ CREATE TABLE IF NOT EXISTS cues (
     ord          INTEGER NOT NULL,
     start_ms     INTEGER NOT NULL,
     end_ms       INTEGER NOT NULL,
+    -- 导入原文：text 为可见文本（去标签、折叠空白），raw_text 为去标签后
+    -- 保留换行的原文，graphemes 为可见文本字素数，raw_hash 为原文 SHA-256。
+    -- 导入后这四列永不改变。
     text         TEXT NOT NULL,
     raw_text     TEXT NOT NULL,
     graphemes    INTEGER NOT NULL,
-    raw_hash     TEXT NOT NULL
+    raw_hash     TEXT NOT NULL,
+    -- 逐条文案修订稿：edited_text 为归一化后的修订文案（与导入同一套
+    -- 去标签/折叠空白规则），NULL 表示未修订——生效文案 = 修订稿 ?? 导入
+    -- 可见文本，生效字素数同理。恢复导入原文即把两列置回 NULL。
+    edited_text  TEXT,
+    edited_graphemes INTEGER
 );
 CREATE TABLE IF NOT EXISTS shots (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,8 +118,18 @@ def init_db() -> None:
     conn = _connect()
     try:
         conn.executescript(_SCHEMA)
+        _migrate(conn)
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """旧库就地迁移：cues 表补文案修订列（新库已由 _SCHEMA 建全）。"""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(cues)")}
+    if "edited_text" not in cols:
+        conn.execute("ALTER TABLE cues ADD COLUMN edited_text TEXT")
+    if "edited_graphemes" not in cols:
+        conn.execute("ALTER TABLE cues ADD COLUMN edited_graphemes INTEGER")
 
 
 def create_project(
@@ -254,3 +273,26 @@ def delete_stale_gap_reviews(
 
 def delete_project(conn: sqlite3.Connection, pid: int) -> None:
     conn.execute("DELETE FROM projects WHERE id=?", (pid,))
+
+
+# ---------- 逐条文案修订 ----------
+
+def update_cue_text(
+    conn: sqlite3.Connection, pid: int, cue_uid: int,
+    edited_text: str, edited_graphemes: int,
+) -> None:
+    """落修订稿（归一化后的非空文案与其字素数）。导入四列不动。"""
+    conn.execute(
+        "UPDATE cues SET edited_text=?, edited_graphemes=?"
+        " WHERE project_id=? AND id=?",
+        (edited_text, edited_graphemes, pid, cue_uid),
+    )
+
+
+def clear_cue_text(conn: sqlite3.Connection, pid: int, cue_uid: int) -> None:
+    """恢复导入原文：清除修订稿，生效文案回落到导入可见文本。"""
+    conn.execute(
+        "UPDATE cues SET edited_text=NULL, edited_graphemes=NULL"
+        " WHERE project_id=? AND id=?",
+        (pid, cue_uid),
+    )

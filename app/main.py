@@ -1,4 +1,4 @@
-"""FastAPI 入口：项目导入、分析、采纳、镜头留白审阅、导出。"""
+"""FastAPI 入口：项目导入、分析、采纳、镜头留白审阅、逐条文案修订、导出。"""
 from __future__ import annotations
 
 import hashlib
@@ -17,7 +17,12 @@ from . import verification as vfy
 from .analysis import build_analysis, revalidate_adoptions
 from .gaps import DECISIONS, compute_shot_gaps
 from .shots import Shot, parse_shots
-from .subtitles import ParsedCue, parse_subtitle, visible_text
+from .subtitles import (
+    ParsedCue,
+    count_graphemes,
+    parse_subtitle,
+    visible_text,
+)
 
 app = FastAPI(title="字幕节奏与镜头边界校正台", version="1.0")
 
@@ -51,9 +56,24 @@ class GapReviewIn(BaseModel):
     decision: str
 
 
+class CueTextIn(BaseModel):
+    """逐条文案修订。base_text 为客户端进入编辑时看到的生效文案
+    （乐观并发基值）：写锁内若当前生效文案已不等于 base_text，说明另一
+    标签页/会话先改过，拒绝覆盖（409），由调用方刷新后基于最新文案重试。
+    """
+    text: str
+    base_text: str
+
+
+class CueTextResetIn(BaseModel):
+    """恢复导入原文。base_text 语义同 CueTextIn。"""
+    base_text: str
+
+
 # ---------- 序列化 ----------
 
 def _cue_row(row) -> dict:
+    edited = row["edited_text"] is not None
     return {
         "uid": row["id"],
         "cue_id": row["cue_id"],
@@ -63,10 +83,30 @@ def _cue_row(row) -> dict:
         "text": row["text"],
         "graphemes": row["graphemes"],
         "raw_hash": row["raw_hash"],
+        "edited_text": row["edited_text"],
+        "text_edited": edited,
+        "effective_text": row["edited_text"] if edited else row["text"],
         "adopted_start_ms": row["new_start_ms"],
         "adopted_end_ms": row["new_end_ms"],
         "adopted": row["new_start_ms"] is not None,
     }
+
+
+def _parsed_from_rows(cue_db_rows) -> list[ParsedCue]:
+    """由库中字幕行构造分析输入：文案与字素数取**生效值**（已修订取修订稿，
+    未修订取导入可见文本），CPS、生效轴指纹、导出与交付核验由此自动跟随
+    文案修订；raw_hash 始终为导入原文哈希，不随修订改变。"""
+    parsed = []
+    for r in cue_db_rows:
+        edited = r["edited_text"] is not None
+        parsed.append(ParsedCue(
+            cue_id=r["cue_id"], ord=r["ord"],
+            start_ms=r["start_ms"], end_ms=r["end_ms"],
+            raw_text=r["edited_text"] if edited else r["text"],
+            graphemes=r["edited_graphemes"] if edited else r["graphemes"],
+            raw_hash=r["raw_hash"],
+        ))
+    return parsed
 
 
 def _load_inputs(conn, pid: int) -> tuple:
@@ -76,14 +116,7 @@ def _load_inputs(conn, pid: int) -> tuple:
         raise HTTPException(404, "项目不存在")
     cue_db_rows = list(db.get_cues(conn, pid))
     shot_rows = list(db.get_shots(conn, pid))
-    parsed = [
-        ParsedCue(
-            cue_id=r["cue_id"], ord=r["ord"],
-            start_ms=r["start_ms"], end_ms=r["end_ms"],
-            raw_text=r["text"], graphemes=r["graphemes"],
-            raw_hash=r["raw_hash"],
-        ) for r in cue_db_rows
-    ]
+    parsed = _parsed_from_rows(cue_db_rows)
     shots = [Shot(ord=s["ord"], start_ms=s["start_ms"], end_ms=s["end_ms"])
              for s in shot_rows]
     return prow, cue_db_rows, shots, parsed
@@ -100,11 +133,11 @@ def _effective_report_times(rep) -> tuple[int, int]:
 
 
 def _timeline_hash(analysis) -> str:
-    """生效时间轴指纹：覆盖核验输入 refs 的全部字段（ord / cue_id / 可见
-    文本 / 生效起止毫秒）。参数重算、采纳、撤销只要改变了生效轴，哈希必变；
-    不改变生效轴的操作（仅调 CPS 上限、相同参数重提、修改失败回滚）哈希
-    保持不变。项目详情与 verify-delivery 响应携带同一指纹，前端据此判定
-    已展示的核验结论是否过期。"""
+    """生效时间轴指纹：覆盖核验输入 refs 的全部字段（ord / cue_id / 生效
+    文案 / 生效起止毫秒）。参数重算、采纳、撤销、文案修订或恢复只要改变了
+    生效轴（含生效文案），哈希必变；不改变生效轴的操作（仅调 CPS 上限、
+    相同参数重提、修改失败回滚）哈希保持不变。项目详情与 verify-delivery
+    响应携带同一指纹，前端据此判定已展示的核验结论是否过期。"""
     h = hashlib.sha256()
     for rep in analysis.cues:
         s, e = _effective_report_times(rep)
@@ -148,8 +181,9 @@ def _gap_review_payload(conn, pid: int, shots: list[Shot], analysis) -> dict:
 
 
 def _prune_gap_reviews(conn, pid: int, payload: dict) -> None:
-    """写路径（参数重算 / 采纳 / 撤销）在最终 _recompute 之后调用：删除
-    不再匹配任何当前留白项的过期结论，使边界变化的区间回到待审。"""
+    """写路径（参数重算 / 采纳 / 撤销 / 文案修订）在最终 _recompute 之后
+    调用：删除不再匹配任何当前留白项的过期结论，使边界变化的区间回到
+    待审。文案修订不改变时间轴，留白项不变、结论全部保留。"""
     valid = {(it["shot_ord"], it["gap_start_ms"], it["gap_end_ms"])
              for it in payload["gap_review"]["items"]}
     db.delete_stale_gap_reviews(conn, pid, valid)
@@ -167,6 +201,11 @@ def _recompute_from(conn, pid: int, prow, cue_db_rows, shots, parsed) -> dict:
         rep.adopted = dbr["new_start_ms"] is not None
         rep.adopted_start_ms = dbr["new_start_ms"]
         rep.adopted_end_ms = dbr["new_end_ms"]
+        # 文案修订：rep.text / rep.graphemes 已是生效值（修订稿优先）；
+        # 这里补充导入原文信息，供页面区分展示「导入原文 vs 修订稿」。
+        rep.imported_text = dbr["text"]
+        rep.imported_graphemes = dbr["graphemes"]
+        rep.text_edited = dbr["edited_text"] is not None
     return {
         "id": prow["id"],
         "name": prow["name"],
@@ -273,24 +312,10 @@ def update_settings(pid: int, body: SettingsIn):
     # 会撤销新参数下失效者；若本事务先拿到锁，采纳请求会阻塞到本事务
     # 提交，随后按新参数重读并拒绝失效旧提案（见 adopt）。
     with db.get_conn(write=True) as conn:
-        prow = db.get_project(conn, pid)
-        if prow is None:
-            raise HTTPException(404, "项目不存在")
-        cue_rows = list(db.get_cues(conn, pid))
-        shot_rows = list(db.get_shots(conn, pid))
-        shots = [Shot(ord=s["ord"], start_ms=s["start_ms"], end_ms=s["end_ms"])
-                 for s in shot_rows]
-        parsed = [
-            ParsedCue(
-                cue_id=r["cue_id"], ord=r["ord"],
-                start_ms=r["start_ms"], end_ms=r["end_ms"],
-                raw_text=r["text"], graphemes=r["graphemes"],
-                raw_hash=r["raw_hash"],
-            ) for r in cue_rows
-        ]
+        prow, cue_rows, shots, parsed = _load_inputs(conn, pid)
         # 同一写事务内：用新参数求提案（与详情/采纳校验完全同一套
-        # build_analysis 规则）。失败则由 get_conn 整体回滚，参数与
-        # 采纳状态都不会被改动。
+        # build_analysis 规则，文案取生效值）。失败则由 get_conn 整体回滚，
+        # 参数与采纳状态都不会被改动。
         analysis = build_analysis(
             parsed, shots, body.cps_limit,
             body.min_gap_ms, body.tolerance_ms,
@@ -306,7 +331,7 @@ def update_settings(pid: int, body: SettingsIn):
         # 下面任一步异常都会触发整事务回滚，不留半更新。
         db.update_settings(conn, pid, body.cps_limit,
                            body.min_gap_ms, body.tolerance_ms)
-        shot_ranges = [(s["start_ms"], s["end_ms"]) for s in shot_rows]
+        shot_ranges = [(s.start_ms, s.end_ms) for s in shots]
         for uid in revalidate_adoptions(
             cue_rows, shot_ranges, body.tolerance_ms, body.min_gap_ms,
             proposals,
@@ -353,6 +378,66 @@ def adopt(pid: int, body: AdoptIn):
 def revert_adoption(pid: int, cue_uid: int):
     with db.get_conn(write=True) as conn:
         db.delete_adoption(conn, pid, cue_uid)
+        payload = _recompute(conn, pid)
+        _prune_gap_reviews(conn, pid, payload)
+        return payload
+
+
+# ---------- 逐条文案修订 ----------
+
+def _effective_db_text(row) -> str:
+    """库中一条字幕的当前生效文案：已修订取修订稿，否则取导入可见文本。"""
+    return row["edited_text"] if row["edited_text"] is not None else row["text"]
+
+
+def _load_cue_for_text_edit(conn, pid: int, cue_uid: int):
+    """写锁内定位目标 cue；项目 / cue 不存在则 404 / 400。"""
+    if db.get_project(conn, pid) is None:
+        raise HTTPException(404, "项目不存在")
+    target = next((r for r in db.get_cues(conn, pid) if r["id"] == cue_uid),
+                  None)
+    if target is None:
+        raise HTTPException(400, "cue 不存在")
+    return target
+
+
+@app.put("/api/projects/{pid}/cues/{cue_uid}/text")
+def revise_cue_text(pid: int, cue_uid: int, body: CueTextIn):
+    """逐条修订字幕文案。保存时沿用导入同一套归一化规则（去标签、折叠
+    空白、按 Unicode 扩展字素簇计数）得到非空当前文案；空白稿（归一化后
+    为空）400 拒绝。base_text 与写锁内当前生效文案不符（另一标签页先改
+    过）时 409 拒绝覆盖，调用方刷新后即可看到最新文案。修订只改文案：
+    cue_id、原时间、采纳与镜头留白结论保持不变；CPS 告警、生效轴指纹与
+    JSON/SRT/ZIP 导出文案随生效文案同步更新，JSON 原文哈希仍指向导入
+    内容。任一校验失败或写库异常都整体回滚，不会部分写入。"""
+    new_text = visible_text(body.text)
+    if not new_text:
+        raise HTTPException(
+            400, "文案为空：去标签、折叠空白后必须至少保留一个可见字素")
+    new_graphemes = count_graphemes(body.text)
+    # 与采纳同理：先取写锁再读取校验，后到请求看到的必为最新已提交状态。
+    with db.get_conn(write=True) as conn:
+        target = _load_cue_for_text_edit(conn, pid, cue_uid)
+        if _effective_db_text(target) != body.base_text:
+            raise HTTPException(
+                409, "该字幕文案已在其他页面被修改，请基于最新文案重新编辑")
+        db.update_cue_text(conn, pid, cue_uid, new_text, new_graphemes)
+        payload = _recompute(conn, pid)
+        _prune_gap_reviews(conn, pid, payload)
+        return payload
+
+
+@app.post("/api/projects/{pid}/cues/{cue_uid}/text/reset")
+def reset_cue_text(pid: int, cue_uid: int, body: CueTextResetIn):
+    """恢复导入原文：清除修订稿，生效文案回落到导入可见文本。并发语义
+    与修订一致：base_text 过期（另一标签页先改过）时 409 拒绝，不会把
+    别人的新修订稿误清回原文。"""
+    with db.get_conn(write=True) as conn:
+        target = _load_cue_for_text_edit(conn, pid, cue_uid)
+        if _effective_db_text(target) != body.base_text:
+            raise HTTPException(
+                409, "该字幕文案已在其他页面被修改，请基于最新文案重新操作")
+        db.clear_cue_text(conn, pid, cue_uid)
         payload = _recompute(conn, pid)
         _prune_gap_reviews(conn, pid, payload)
         return payload
@@ -476,6 +561,7 @@ def export(pid: int, fmt: str = "json"):
         "document_hash": "",
         "cues": [{
             "cue_id": c["cue_id"],
+            # 原文哈希始终指向导入内容，不随文案修订改变
             "raw_text_hash": c["raw_hash"],
             "graphemes": c["graphemes"],
             "original": {"start_ms": c["start_ms"], "end_ms": c["end_ms"]},
@@ -492,7 +578,11 @@ def export(pid: int, fmt: str = "json"):
             "status": ("corrected" if c["adopted"]
                        else ("proposed" if c["proposal_start_ms"] is not None
                              else "conflict")),
+            # 生效文案（修订稿优先，未修订即导入可见文本）；导入原文与
+            # 修订标记一并给出，便于下游区分导入原文与修订稿
             "text": c["text"],
+            "edited": c["text_edited"],
+            "imported_text": c["imported_text"],
         } for c in data["analysis"]["cues"]],
         "conflicts": {
             "chains": data["analysis"]["chains"],

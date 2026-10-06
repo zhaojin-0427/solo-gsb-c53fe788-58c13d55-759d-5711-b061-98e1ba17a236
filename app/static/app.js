@@ -14,6 +14,11 @@ const state = {
   // 读取快照，绝不读取文件框当前值，避免把改选未提交稿的结论当成旧稿的。
   verifySnapshot: null,  // {file, name, projectId} 最近一次已提交的稿件
   verifyAutoInFlight: false,  // 同一生效轴上的自动重核是否在途（防重复触发）
+  // 逐条文案修订的行内编辑态：{uid, baseText, draft}。baseText 是进入编辑
+  // 时看到的生效文案，随保存/恢复请求提交给服务端做乐观并发校验——另一
+  // 标签页先改过（服务端生效文案已不等于 baseText）时请求被 409 拒绝，
+  // 本页随即刷新详情显示最新文案，不会覆盖他人的修改。
+  textEdit: null,
 };
 
 const VERIFY_LABEL = {
@@ -58,7 +63,9 @@ async function api(path, opts = {}) {
   if (!res.ok) {
     let msg = `HTTP ${res.status}`;
     try { msg = (await res.json()).detail || msg; } catch (_) {}
-    throw new Error(msg);
+    const err = new Error(msg);
+    err.status = res.status;   // 409=文案已被他人改过等并发冲突，供调用方区分
+    throw err;
   }
   return res.json();
 }
@@ -375,8 +382,55 @@ function renderDeliveryVerify() {
   }
 }
 
+// ---------- 逐条文案修订 ----------
+// 生效文案 = 修订稿 ?? 导入可见文本（服务端 analysis.cues[].text 已是生效值，
+// imported_text 为导入可见文本，text_edited 标记是否已修订）。保存/恢复都
+// 携带进入操作时的生效文案作 base_text：另一标签页先改过时服务端 409 拒绝，
+// 本页刷新详情显示最新文案，绝不覆盖他人修改。
+function syncTextEdit() {
+  const edit = state.textEdit;
+  if (!edit) return;
+  const p = state.project;
+  if (!p) { state.textEdit = null; return; }   // 项目已卸载：静默退出编辑
+  const c = p.analysis.cues.find(x => x.uid === edit.uid);
+  // 详情刷新后该条生效文案已变化（另一标签页改过并同步到本页）：退出编辑，
+  // 避免基于过期文案继续编辑；保存时的 base_text 校验是最后防线。
+  if (!c || c.text !== edit.baseText) {
+    state.textEdit = null;
+    toast("该字幕文案已在别处更新，已退出编辑并显示最新文案", true);
+  }
+}
+
+function renderTextCell(c) {
+  const edit = state.textEdit;
+  if (edit && edit.uid === c.uid) {
+    return `
+      <div class="text-edit-box">
+        <textarea data-text-draft="${c.uid}" rows="3"
+          placeholder="修订文案（保存时去标签、折叠空白，按字素簇计数）">${esc(edit.draft)}</textarea>
+        <div class="text-edit-actions">
+          <button class="mini primary" data-text-act="save" data-uid="${c.uid}">保存</button>
+          <button class="mini" data-text-act="cancel" data-uid="${c.uid}">取消</button>
+        </div>
+        <div class="hash">导入原文：${esc(c.imported_text)}</div>
+      </div>`;
+  }
+  const badge = c.text_edited ? `<span class="pill edited">已修订</span>` : "";
+  const imported = c.text_edited
+    ? `<div class="hash">导入原文：${esc(c.imported_text)}</div>` : "";
+  return `
+    ${esc(c.text)} ${badge}
+    ${imported}
+    <div class="hash">sha256:${c.raw_hash.slice(0, 16)}…（导入原文）</div>
+    <div class="row-actions text-actions">
+      <button class="mini" data-text-act="edit" data-uid="${c.uid}">修订</button>
+      ${c.text_edited ? `<button class="mini" data-text-act="reset" data-uid="${c.uid}">恢复原文</button>` : ""}
+    </div>`;
+}
+
 function render() {
   syncDeliveryVerify();   // 先按最新生效轴同步核验状态（作废/自动重核）
+  syncTextEdit();         // 文案已在别处变化时退出行内编辑
   const p = state.project;
   if (!p) {
     $("#workspace").classList.add("hidden");
@@ -457,10 +511,10 @@ function render() {
     tr.innerHTML = `
       <td>${c.ord}</td>
       <td>${esc(c.cue_id)}</td>
-      <td class="text-cell">${esc(c.text)}<div class="hash">sha256:${c.raw_hash.slice(0, 16)}…</div></td>
+      <td class="text-cell">${renderTextCell(c)}</td>
       <td>${startShown} → ${endShown}</td>
       <td>${c.duration_ms}</td>
-      <td>${c.graphemes}</td>
+      <td>${c.graphemes}${c.text_edited ? `<span class="muted" title="导入原文 ${c.imported_graphemes} 字素">（原 ${c.imported_graphemes}）</span>` : ""}</td>
       <td class="${c.cps_ok ? "cps-ok" : "cps-bad"}">${c.cps === Infinity ? "∞" : c.cps}</td>
       <td>${flags.join("") || "—"}</td>
       <td>${propTxt}</td>
@@ -501,6 +555,7 @@ $("#importForm").addEventListener("submit", async (ev) => {
   if (f.shots_file.files[0]) fd.append("shots_file", f.shots_file.files[0]);
   try {
     state.project = await api("/api/projects", { method: "POST", body: fd });
+    state.textEdit = null;
     resetDeliveryVerify();
     toast("导入并分析完成");
     await loadProjects();
@@ -584,6 +639,70 @@ $("#adoptAllBtn").addEventListener("click", async () => {
   }
 });
 
+// 逐条文案修订：行内编辑 / 保存 / 取消 / 恢复导入原文。
+// 保存与恢复都携带 base_text（进入操作时看到的生效文案）；另一标签页先
+// 改过时服务端 409 拒绝——本页退出编辑并刷新详情，显示最新文案，不覆盖
+// 他人修改。400（空白稿等校验失败）保持编辑态，便于就地修正。
+$("#cueTable").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button[data-text-act]");
+  if (!btn || !state.project) return;
+  const uid = parseInt(btn.dataset.uid, 10);
+  const c = state.project.analysis.cues.find(x => x.uid === uid);
+  if (!c) return;
+  const pid = state.project.id;
+  const act = btn.dataset.textAct;
+  if (act === "edit") {
+    state.textEdit = { uid, baseText: c.text, draft: c.text };
+    render();
+    return;
+  }
+  if (act === "cancel") {
+    state.textEdit = null;
+    render();
+    return;
+  }
+  try {
+    if (act === "save") {
+      const edit = state.textEdit;
+      if (!edit || edit.uid !== uid) return;
+      state.project = await api(`/api/projects/${pid}/cues/${uid}/text`, {
+        method: "PUT",
+        body: JSON.stringify({ text: edit.draft, base_text: edit.baseText }),
+      });
+      state.textEdit = null;
+      toast(`已修订 cue ${c.cue_id} 的文案`);
+    } else if (act === "reset") {
+      state.project = await api(
+        `/api/projects/${pid}/cues/${uid}/text/reset`, {
+          method: "POST",
+          body: JSON.stringify({ base_text: c.text }),
+        });
+      state.textEdit = null;
+      toast(`已恢复 cue ${c.cue_id} 的导入原文`);
+    }
+    render();
+    loadProjects();
+  } catch (e) {
+    if (e.status === 409) {
+      // 另一标签页先改过：拒绝覆盖，刷新详情显示最新文案
+      state.textEdit = null;
+      toast(e.message + "（已刷新为最新文案）", true);
+      refreshAfterConflict(pid);
+    } else {
+      toast(e.message, true);   // 空白稿等：保持编辑态就地修正
+    }
+  }
+});
+
+// 编辑中的草稿实时同步到 state，重绘（如统计条刷新）后不丢失输入。
+$("#cueTable").addEventListener("input", (ev) => {
+  const ta = ev.target.closest("textarea[data-text-draft]");
+  if (!ta || !state.textEdit) return;
+  if (parseInt(ta.dataset.textDraft, 10) === state.textEdit.uid) {
+    state.textEdit.draft = ta.value;
+  }
+});
+
 // 镜头留白审阅：标记 / 清除。过期页面（参数或采纳已在别处变化）提交的
 // 结论会被服务端 400 拒绝，此时刷新到最新状态，避免误标新留白。
 $("#gapList").addEventListener("click", async (ev) => {
@@ -643,6 +762,7 @@ $("#deleteProjectBtn").addEventListener("click", async () => {  if (!state.proje
   try {
     await api(`/api/projects/${state.project.id}`, { method: "DELETE" });
     state.project = null;
+    state.textEdit = null;
     resetDeliveryVerify();
     toast("项目已删除");
     await loadProjects();
@@ -654,6 +774,7 @@ $("#projectSelect").addEventListener("change", async (ev) => {
   const id = ev.target.value;
   if (!id) return;
   resetDeliveryVerify();   // 先作废旧项目核验并使在途响应失效，再切换
+  state.textEdit = null;   // 行内编辑不跨项目保留
   try {
     state.project = await api(`/api/projects/${id}`);
     render();
@@ -662,6 +783,7 @@ $("#projectSelect").addEventListener("change", async (ev) => {
 
 $("#newProjectBtn").addEventListener("click", () => {
   state.project = null;
+  state.textEdit = null;
   resetDeliveryVerify();
   $("#projectSelect").value = "";
   render();

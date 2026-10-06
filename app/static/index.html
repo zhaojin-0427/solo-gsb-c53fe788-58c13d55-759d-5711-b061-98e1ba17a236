@@ -82,7 +82,7 @@
       <table id="cueTable">
         <thead>
           <tr>
-            <th>#</th><th>cue_id</th><th>原文（哈希）</th>
+            <th>#</th><th>cue_id</th><th>文案（生效 / 导入原文）</th>
             <th>原起→止 (ms)</th><th>时长</th><th>字素</th><th>CPS</th>
             <th>检测</th><th>提案 起→止</th><th>Δ</th><th>状态/操作</th>
           </tr>
@@ -90,6 +90,11 @@
         <tbody></tbody>
       </table>
     </div>
+    <p class="hint">文案列显示当前生效文案；点「修订」可逐条修改（保存时去标签、
+      折叠空白、按 Unicode 字素簇计数，空白稿会被拒绝），「恢复原文」回到导入文案。
+      修订即时反映到 CPS 告警、JSON/SRT/ZIP 导出与交付核验的生效轴指纹；
+      原文哈希始终指向导入内容。若另一标签页先改过同一条，保存会被拒绝并自动
+      刷新显示最新文案。</p>
 
     <!-- 镜头留白审阅 -->
     <section id="gapReviewPanel" class="gap-review hidden">

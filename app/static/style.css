@@ -154,3 +154,16 @@ tr.row-proposed td { }
 .verify-row.verdict-pending { background: rgba(242, 180, 65, .07); }
 .warn-text { color: var(--warn); }
 
+/* 逐条文案修订 */
+.pill.edited { background: rgba(78,161,255,.14); color: var(--accent); }
+.text-actions { margin-top: 4px; }
+.text-edit-box textarea {
+  width: 100%; min-width: 260px; min-height: 64px; resize: vertical;
+  font: inherit; color: var(--text); background: var(--panel-2);
+  border: 1px solid var(--accent); border-radius: 6px; padding: 6px 8px;
+}
+.text-edit-box textarea:focus {
+  outline: 2px solid var(--accent); outline-offset: -1px;
+}
+.text-edit-actions { display: flex; gap: 6px; margin: 6px 0 4px; }
+
